@@ -60,22 +60,16 @@ typedef struct prog_state_type
     uint32_t turn_duration_ticks;
     uint8_t turn_active;
     uint8_t recovery_stage;
-    uint32_t recovery_wait_tick;
     uint8_t recovery_direction;
-    uint8_t recovery_turn_count;
+    uint32_t line_lost_tick;
 
     // Milestone 4: Autonomous state
     uint8_t line_tracing_active;
     uint8_t wall_following_active;
 
     // SOS state
-    uint8_t sos_active;         // 1 = SOS triggered
-    uint32_t sos_start_tick;    // When SOS started
-    uint32_t sos_blink_pattern; // Current pattern index
-
-    // Lost-line tracking
-    uint8_t lost_line_count;   // Counter for consecutive no-sensor readings
-#define LOST_LINE_THRESHOLD 50 // ~600 ms at 30 ms update rate
+    uint8_t sos_active;      // 1 = SOS triggered
+    uint32_t sos_start_tick; // When SOS started
 
 } prog_state_t;
 
@@ -150,7 +144,6 @@ static void prog_trigger_sos(prog_state_t *ps, const char *reason)
 static void prog_exit_sos(prog_state_t *ps)
 {
     ps->sos_active = 0;
-    ps->lost_line_count = 0;
 
     // PA16 LOW when SOS is cleared
     PORT_SEC_REGS->GROUP[0].PORT_OUTCLR = (1 << 16);
@@ -160,12 +153,9 @@ static void prog_loop_do_line_tracing(prog_state_t *ps)
 {
     if (!ps->line_tracing_active)
         return;
-    if (ps->turn_active)
-        return;
 
     static uint32_t last_update_tick = 0;
     static uint8_t last_action = 0;
-    static uint8_t lost_count = 0;
     // 0 = stop
     // 1 = forward
     // 2 = hard left
@@ -228,58 +218,70 @@ static void prog_loop_do_line_tracing(prog_state_t *ps)
     // ===== LOST TRACK DETECTION =====
     if (!any_sensor_see_line)
     {
-        // No sensor sees the line
-        ps->lost_line_count++;
-        // Brief recovery window: keep last action
-        lost_count++;
 
-        if (ps->lost_line_count >= LOST_LINE_THRESHOLD)
+        if (!ps->recovery_stage)
         {
-
-            ps->recovery_turn_count = 0;
             ps->recovery_stage = 1;
+            ps->line_lost_tick = now;
+        }
 
-            if (ps->recovery_direction == 1)
-            {
+        uint32_t lost_time = platform_tick_delta(now, ps->line_lost_tick);
 
-                platform_motor_left();
-            }
-            else
-            {
-
-                platform_motor_right();
-            }
-
-            platform_motor_set_pwm(100, 100);
-
-            ps->turn_duration_ticks = (45 * 2) / 5;
-            ps->turn_start_tick = platform_systick_count();
-            ps->turn_active = 1;
-
-            ps->lost_line_count = 0;
-
+        // SOS after 10 seconds
+        if (lost_time >= 1000)
+        {
+            prog_trigger_sos(ps, "Line Lost - SOS!\r\n");
             return;
         }
 
-        if (lost_count < 10)
+        if (ps->recovery_direction == 1)
         {
-            action = last_action;
+
+            // LEFT ARC SEARCH
+
+            platform_motor_left();
+
+            if (lost_time < 100)
+            {
+                platform_motor_set_pwm(35, 35);
+            }
+            else if (lost_time < 300)
+            {
+                platform_motor_set_pwm(55, 55);
+            }
+            else
+            {
+                platform_motor_set_pwm(75, 75);
+            }
         }
+
         else
         {
-            action = 0; // Stop if still no line
+
+            // RIGHT ARC SEARCH
+
+            platform_motor_right();
+
+            if (lost_time < 100)
+            {
+                platform_motor_set_pwm(35, 35);
+            }
+            else if (lost_time < 300)
+            {
+                platform_motor_set_pwm(55, 55);
+            }
+            else
+            {
+                platform_motor_set_pwm(75, 75);
+            }
         }
+        return;
     }
     else if (any_sensor_see_line)
     {
 
-        // Line detected again - reset counter
-        ps->lost_line_count = 0;
-        lost_count = 0;
-
         // cancel recovery only if line found again
         ps->recovery_stage = 0;
-        ps->turn_active = 0;
 
         /*
          * Priority:
@@ -383,63 +385,6 @@ static void prog_loop_check_turn_timer(prog_state_t *ps)
             platform_motor_stop();
 
             ps->turn_active = 0;
-
-            ps->recovery_wait_tick = now;
-        }
-    }
-
-    // =====================================
-    // WAIT BETWEEN RECOVERY TURNS
-    // =====================================
-
-    if (!ps->turn_active && ps->recovery_stage == 1)
-    {
-
-        uint32_t wait_elapsed =
-            platform_tick_delta(now, ps->recovery_wait_tick);
-
-        // 1 second wait
-        if (wait_elapsed >= 100)
-        {
-
-            ps->recovery_turn_count++;
-
-            // =================================
-            // DONE 3 TURNS -> SOS
-            // =================================
-
-            if (ps->recovery_turn_count >= 3)
-            {
-
-                ps->recovery_stage = 0;
-
-                prog_trigger_sos(
-                    ps,
-                    "Line Lost After Recovery - SOS!\r\n");
-
-                return;
-            }
-
-            // =================================
-            // CONTINUE SAME DIRECTION TURN
-            // =================================
-
-            if (ps->recovery_direction == 1)
-            {
-
-                platform_motor_left();
-            }
-            else
-            {
-
-                platform_motor_right();
-            }
-
-            platform_motor_set_pwm(100, 100);
-
-            ps->turn_duration_ticks = (45 * 2) / 5;
-            ps->turn_start_tick = now;
-            ps->turn_active = 1;
         }
     }
 }
@@ -475,7 +420,7 @@ static void prog_loop_do_wall_following(prog_state_t *ps)
     // Thresholds
     // =========================
 
-#define FRONT_WALL_CM 15
+#define FRONT_WALL_CM 30
 #define SIDE_WALL_CM 15
 
     bool front_blocked = (front_cm > 0 && front_cm < FRONT_WALL_CM);
@@ -489,7 +434,7 @@ static void prog_loop_do_wall_following(prog_state_t *ps)
     if (!front_blocked)
     {
         platform_motor_forward();
-        platform_motor_set_pwm(45, 45);
+        platform_motor_set_pwm(50, 50);
         return;
     }
 
