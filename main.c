@@ -61,6 +61,8 @@ typedef struct prog_state_type
     uint8_t turn_active;
     uint8_t recovery_stage;
     uint8_t recovery_direction;
+    uint32_t recovery_wait_tick;
+    uint8_t recovery_turn_count;
     uint32_t line_lost_tick;
 
     // Milestone 4: Autonomous state
@@ -144,6 +146,7 @@ static void prog_trigger_sos(prog_state_t *ps, const char *reason)
 static void prog_exit_sos(prog_state_t *ps)
 {
     ps->sos_active = 0;
+    ps->recovery_stage = 0;
 
     // PA16 LOW when SOS is cleared
     PORT_SEC_REGS->GROUP[0].PORT_OUTCLR = (1 << 16);
@@ -153,9 +156,12 @@ static void prog_loop_do_line_tracing(prog_state_t *ps)
 {
     if (!ps->line_tracing_active)
         return;
+    if (ps->turn_active)
+        return;
 
     static uint32_t last_update_tick = 0;
     static uint8_t last_action = 0;
+    static uint8_t lost_count = 0;
     // 0 = stop
     // 1 = forward
     // 2 = hard left
@@ -164,6 +170,17 @@ static void prog_loop_do_line_tracing(prog_state_t *ps)
     // 5 = soft right
 
     uint32_t now = platform_systick_count();
+
+    if (ps->recovery_stage == 2)
+    {
+
+        if (platform_tick_delta(now, ps->recovery_wait_tick) < 50)
+        {
+            return;
+        }
+
+        ps->recovery_stage = 0;
+    }
 
     // Do not change motor command too fast.
     // PLATFORM_MS_PER_SYSTICK is 10 ms in your init.h.
@@ -219,69 +236,99 @@ static void prog_loop_do_line_tracing(prog_state_t *ps)
     if (!any_sensor_see_line)
     {
 
-        if (!ps->recovery_stage)
+        if (lost_count == 0)
         {
-            ps->recovery_stage = 1;
             ps->line_lost_tick = now;
         }
+        lost_count++;
 
-        uint32_t lost_time = platform_tick_delta(now, ps->line_lost_tick);
+        uint32_t total_lost_time =
+            platform_tick_delta(now, ps->line_lost_tick);
 
-        // SOS after 10 seconds
-        if (lost_time >= 1000)
+        if (total_lost_time >= 1000)
         {
             prog_trigger_sos(ps, "Line Lost - SOS!\r\n");
+
             return;
         }
 
-        if (ps->recovery_direction == 1)
+        if (lost_count < 10)
         {
+            action = last_action;
+            goto APPLY_ACTION;
+        }
 
-            // LEFT ARC SEARCH
+        uint8_t sweep_left;
+
+        if ((ps->recovery_turn_count % 2) == 0)
+        {
+            sweep_left = (ps->recovery_direction == 1);
+        }
+        else
+        {
+            sweep_left = (ps->recovery_direction != 1);
+        }
+
+        if (sweep_left)
+        {
 
             platform_motor_left();
 
-            if (lost_time < 100)
+            if (ps->recovery_turn_count == 0)
             {
-                platform_motor_set_pwm(35, 35);
+                platform_motor_set_pwm(45, 45);
+                ps->turn_duration_ticks = (20 * 2) / 5;
             }
-            else if (lost_time < 300)
+            else if (ps->recovery_turn_count == 1)
             {
-                platform_motor_set_pwm(55, 55);
+                platform_motor_set_pwm(60, 60);
+                ps->turn_duration_ticks = (40 * 2) / 5;
             }
             else
             {
                 platform_motor_set_pwm(75, 75);
+                ps->turn_duration_ticks = (70 * 2) / 5;
             }
         }
 
         else
         {
 
-            // RIGHT ARC SEARCH
-
             platform_motor_right();
 
-            if (lost_time < 100)
+            if (ps->recovery_turn_count == 0)
             {
-                platform_motor_set_pwm(35, 35);
+                platform_motor_set_pwm(45, 45);
+                ps->turn_duration_ticks = (20 * 2) / 5;
             }
-            else if (lost_time < 300)
+            else if (ps->recovery_turn_count == 1)
             {
-                platform_motor_set_pwm(55, 55);
+                platform_motor_set_pwm(60, 60);
+                ps->turn_duration_ticks = (40 * 2) / 5;
             }
             else
             {
                 platform_motor_set_pwm(75, 75);
+                ps->turn_duration_ticks = (70 * 2) / 5;
             }
         }
+
+        ps->turn_start_tick = platform_systick_count();
+        ps->turn_active = 1;
+
+        ps->recovery_stage = 1;
+        ps->recovery_wait_tick = now;
+
         return;
     }
     else if (any_sensor_see_line)
     {
-
         // cancel recovery only if line found again
         ps->recovery_stage = 0;
+
+        lost_count = 0;
+        ps->line_lost_tick = 0;
+        ps->recovery_turn_count = 0;
 
         /*
          * Priority:
@@ -332,6 +379,7 @@ static void prog_loop_do_line_tracing(prog_state_t *ps)
             action = last_action;
         }
     }
+APPLY_ACTION:
     last_action = action;
 
     if (action == 1)
@@ -385,6 +433,16 @@ static void prog_loop_check_turn_timer(prog_state_t *ps)
             platform_motor_stop();
 
             ps->turn_active = 0;
+
+            if (ps->recovery_stage == 1)
+            {
+
+                ps->recovery_turn_count++;
+
+                // Wait before next recovery sweep
+                ps->recovery_stage = 2;
+                ps->recovery_wait_tick = now;
+            }
         }
     }
 }
@@ -649,6 +707,9 @@ static void prog_loop_do_one_rx(prog_state_t *ps)
             {
                 ps->wall_following_active = 0;
                 ps->line_tracing_active = 1; // Enter Milestone 4 mode
+
+                ps->recovery_stage = 0;
+
                 ps->response_msg = msg_line_start;
                 ps->turn_active = 0;
             }
@@ -783,6 +844,7 @@ int main(void)
 
     // Early initialization
     memset(&ps, 0, sizeof(ps));
+    ps.recovery_direction = 1;
     platform_init_early();
 
     // Other initialization
